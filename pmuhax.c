@@ -1,23 +1,47 @@
 /*
  * pmupatch_mini4_ios13.c
  *
- * PMU patch for iPad mini 4 iOS 13.1 kernelcache (kernel13.raw style).
- * Makes the D2207PMU kext match pmu,d2186 device-tree node so the iPod
- * touch 6 (or mini4 with D2186 hardware) can boot with this kernel.
+ * PMU compatibility patch: iPad mini 4 iOS 13.1 kernelcache.
  *
- * Patches applied:
- *   [1] IONameMatch pmu,d2207 → pmu,d2186    (plist, same-length)
- *   [2] IOClass AppleD2207PMU → AppleD2186PMU (plist, same-length)
- *   [3] IOProviderClass sub-entries (WatchDog+RTC) same rename
- *   [4] LDO voltage table: D2207 20-row table → D2186 values
- *   [5] _setLDO register addresses: 0x000f4240 (D2207) → D2186 equivalents
+ * Background
+ * ----------
+ * iPad mini 4 (J96/J97) uses a Dialog D2186 PMU — same silicon as iPod touch 6.
+ * The iOS 13.1 kernelcache ships AppleD2207PMU with IONameMatch "pmu,d2207", but
+ * the device tree publishes the PMU node as "pmu,d2186".  No driver matches →
+ * kernel panic at boot.
+ *
+ * Kext architecture in kernel13
+ * -----------------------------
+ * com.apple.driver.AppleDialogPMU
+ *   LoadAddr  = 0xfffffff005f85d00  (in __PRELINK_TEXT)
+ *   TEXT_EXEC = VA 0xfffffff006db1000, sz 0xa32c  (in __PLK_TEXT_EXEC)
+ *   _setLDO lives here; hard-codes D2207 I2C cmd 0x000f4240 at two sites.
+ *
+ * com.apple.driver.AppleD2207PMU
+ *   Plist-only subclass sharing AppleDialogPMU's LoadAddr.
+ *   IOKitPersonality: IONameMatch = "pmu,d2207"
+ *
+ * Patches applied
+ * ---------------
+ *  [1]  Plist: IONameMatch  "pmu,d2207" → "pmu,d2186"
+ *       NOTE: IOClass/IOProviderClass "AppleD2207PMU" strings are NOT changed.
+ *       AppleD2207PMU is the compiled C++ class in kernel13; renaming it to
+ *       AppleD2186PMU (which does not exist in kernel13) causes a boot panic
+ *       "couldn't alloc class AppleD2186PMU". Only the device-tree match string
+ *       needs to change — the runtime class stays AppleD2207PMU.
+ *  [2]  LDO voltage table @ __PRELINK_TEXT foff 0xc86478:
+ *           D2207 values → D2186 values (20 rows × 12 bytes)
+ *  [3]  _setLDO I2C register command (in AppleDialogPMU TEXT_EXEC, 2 sites):
+ *           MOVZ W1, #0x4240 / MOVK W1, #0xf, lsl#16  (= 0x000f4240, D2207)
+ *         → MOVZ W1, #0x0308 / NOP                     (= 0x00000308, D2186)
  *
  * Build:
  *   cc -O2 -Wall -o pmupatch_mini4_ios13 pmupatch_mini4_ios13.c
  * Usage:
- *   ./pmupatch_mini4_ios13 [-n] [-v] kernel13.raw [out.raw]
- *     -n  dry run (verify only, do not write)
+ *   ./pmupatch_mini4_ios13 [-n] [-v] [-B] kernel13.raw [out.raw]
+ *     -n  dry run
  *     -v  verbose
+ *     -B  skip patch [3] (register address)
  */
 
 #include <stdio.h>
@@ -25,13 +49,10 @@
 #include <stdint.h>
 #include <string.h>
 
-/* ── Mach-O constants ───────────────────────────────────────────── */
 #define MH_MAGIC_64   0xfeedfacfU
 #define LC_SEGMENT_64 0x19U
 
-/* ── LDO tables ─────────────────────────────────────────────────── */
-
-/* D2207 LDO table as found in kernel13 (20 rows × 12 bytes). */
+/* ── LDO tables (20 rows × 12 bytes) ────────────────────────────── */
 static const uint8_t D2207_LDO[240] = {
     0xc4,0x09,0x19,0x7f,0x7f,0x00,0x08,0x03,0x82,0x00,0x02,0x00,
     0xb0,0x04,0x05,0xff,0xff,0x04,0x10,0x03,0x82,0x00,0x04,0x00,
@@ -54,8 +75,6 @@ static const uint8_t D2207_LDO[240] = {
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x85,0x00,0x02,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x85,0x00,0x04,0x00,
 };
-
-/* D2186 LDO table (from kernel12 iPod touch 6 iOS 12.5.8). */
 static const uint8_t D2186_LDO[240] = {
     0xb0,0x04,0x19,0x7f,0x7f,0x00,0x08,0x03,0x82,0x00,0x02,0x00,
     0xb0,0x04,0x05,0xff,0xff,0x04,0x10,0x03,0x82,0x00,0x04,0x00,
@@ -78,355 +97,364 @@ static const uint8_t D2186_LDO[240] = {
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x92,0x00,0x40,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x00,0x40,0x00,
 };
+#define LDO_BYTES 240u
 
-#define LDO_BYTES 240
-
+/* ── _setLDO register-address instruction signatures ─────────────── */
 /*
- * D2207PMU _setLDO register-address signature: two occurrences of:
- *   MOVZ W1, #0x4240
- *   MOVK W1, #0xf, LSL#16   → W1 = 0x000f4240 (D2207 LDO base register)
+ * D2207 I2C LDO command word: page=0x0f, reg_base=0x4240 → W1 = 0x000f4240
+ *   MOVZ W1, #0x4240          0x52884801
+ *   MOVK W1, #0x000f, LSL#16  0x72a001e1
  *
- * Verified at foff 0x1ab0394 and 0x1ab0418 in kernel13.raw.
+ * D2186 replacement: page=0x03, reg_base=0x08 → W1 = 0x00000308
+ *   MOVZ W1, #0x0308  = 0x52806101
+ *   NOP               = 0xd503201f
+ *
+ * Two sites in AppleDialogPMU TEXT_EXEC, verified by context guards:
+ *   Site 0: instructions at [-3,-2,-1] = {0xd63f0100, 0x9100c3e2, 0x52800a00}
+ *   Site 1: instructions at [-3,-2,-1] = {0x94001964, 0x9100c3e2, 0x52807d00}
  */
-#define INSN_MOVZ_W1_4240  0x52884801U   /* movz w1, #0x4240        */
-#define INSN_MOVK_W1_F_16  0x72a001e1U   /* movk w1, #0xf, lsl#16   */
+#define INSN_MOVZ_W1_4240  0x52884801u
+#define INSN_MOVK_W1_F16   0x72a001e1u
+#define INSN_MOVZ_W1_0308  0x52806101u
+#define INSN_NOP           0xd503201fu
 
-/*
- * D2186 LDO base register: 0x0300-series.
- * The D2186 setLDO writes to register 0x03XX via the same I2C helper.
- * After analysis of kernel12's D2186PMU driver, the LDO control register
- * base that replaces 0x000f4240 is 0x00000300 (bits[15:8]=I2C slave addr,
- * bits[7:0]=register offset base; D2186 slave=0x03 reg=0x00 relative to
- * the LDO table's reg field which holds the actual register offset).
- *
- * The D2207 uses a combined 32-bit word 0x000f4240 where:
- *   bits[31:24] = 0x00 (driver-internal flags)
- *   bits[23:16] = 0x0f (D2207 I2C slave address page select)
- *   bits[15:8]  = 0x42 (D2207 base register)
- *   bits[7:0]   = 0x40 (sub-register)
- *
- * D2186 equivalent: The D2186 LDO register address base is passed as
- * the upper word; each row's [7:2] field holds the register offset.
- * Patching to 0x00000300 (MOVZ W1, #0x0300; no MOVK needed / NOP the MOVK)
- * directs the write helper to I2C page 0, register 0x03xx.
- *
- * Since the LDO table rows already carry their own reg offset (bytes 6-7),
- * and the D2186 driver uses those offsets directly, we encode:
- *   MOVZ W1, #0x0000  (upper zero - no slave page override)
- * and keep the MOVK as NOP (MOV X0, X0 = 0xaa0003e0 or just NOP = 0xd503201f)
- *
- * More precisely: in kernel12 D2186PMU, the register address is computed
- * from the LDO row data directly. Since D2207PMU kext is now being driven
- * with D2186 LDO table data, we patch the hard-coded 0x000f4240 base address
- * to 0x00000000 and let the LDO row's register field (bytes [6..7]) govern
- * the actual register written. The write helper adds the row's reg to this base.
- */
-#define INSN_MOVZ_W1_0000  0x52800001U   /* movz w1, #0x0000        */
-#define INSN_NOP           0xd503201fU   /* nop                     */
+static const uint32_t CTX_SITE0[3] = { 0xd63f0100u, 0x9100c3e2u, 0x52800a00u };
+static const uint32_t CTX_SITE1[3] = { 0x94001964u, 0x9100c3e2u, 0x52807d00u };
 
-/* ── Plist string replacements (all same-length) ─────────────────── */
-static const char OLD_NAMEMATCH[] = "pmu,d2207";   /* 9 chars */
+/* ── Plist replacements (same byte length) ───────────────────────── */
+static const char OLD_NAMEMATCH[] = "pmu,d2207";
 static const char NEW_NAMEMATCH[] = "pmu,d2186";
+/* NOTE: IOClass "AppleD2207PMU" is NOT renamed. It is a compiled C++ class
+ * that exists in kernel13. There is no compiled AppleD2186PMU in kernel13. */
 
-static const char OLD_CLASS[]     = "AppleD2207PMU"; /* 13 chars */
-static const char NEW_CLASS[]     = "AppleD2186PMU";
-
-/* ── Helpers ─────────────────────────────────────────────────────── */
+/* ── Utility ─────────────────────────────────────────────────────── */
 static int verbose_flag;
+static void die(const char *m) { fprintf(stderr,"error: %s\n",m); exit(1); }
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v,p,4); return v; }
+static void     wr32(uint8_t *p, uint32_t v) { memcpy(p,&v,4); }
 
-static void die(const char *msg)
+static size_t count_bytes(const uint8_t *h,size_t hl,
+                          const uint8_t *n,size_t nl,size_t *first)
 {
-    fprintf(stderr, "error: %s\n", msg);
-    exit(1);
+    size_t c=0;
+    for(size_t i=0;i+nl<=hl;i++)
+        if(h[i]==n[0]&&!memcmp(h+i,n,nl)){if(!c&&first)*first=i;c++;}
+    return c;
 }
-
-static uint32_t rd32(const uint8_t *p)
+static size_t count_str(const char *h,size_t hl,const char *n)
 {
-    uint32_t v; memcpy(&v, p, 4); return v;
+    size_t c=0,nl=strlen(n);
+    for(size_t i=0;i+nl<=hl;i++) if(h[i]==n[0]&&!memcmp(h+i,n,nl))c++;
+    return c;
 }
-
-static void wr32(uint8_t *p, uint32_t v)
+static size_t replace_str(char *b,size_t len,const char *from,const char *to)
 {
-    memcpy(p, &v, 4);
-}
-
-/* Count and optionally return first occurrence of needle in haystack. */
-static size_t find_bytes(const uint8_t *hay, size_t hlen,
-                         const uint8_t *needle, size_t nlen,
-                         size_t *first_out)
-{
-    size_t n = 0;
-    for (size_t i = 0; i + nlen <= hlen; i++) {
-        if (hay[i] == needle[0] && !memcmp(hay+i, needle, nlen)) {
-            if (!n && first_out) *first_out = i;
-            n++;
-        }
-    }
-    return n;
-}
-
-/* Replace all occurrences of same-length `from` with `to` in a char buffer. */
-static size_t replace_str(char *buf, size_t len,
-                          const char *from, const char *to)
-{
-    size_t fl = strlen(from), c = 0;
-    if (fl != strlen(to)) die("replace_str: length mismatch");
-    for (size_t i = 0; i + fl <= len; i++) {
-        if (buf[i] == from[0] && !memcmp(buf+i, from, fl)) {
-            memcpy(buf+i, to, fl); c++; i += fl - 1;
-        }
-    }
+    size_t fl=strlen(from),c=0;
+    if(fl!=strlen(to)) die("replace_str: length mismatch");
+    for(size_t i=0;i+fl<=len;i++)
+        if(b[i]==from[0]&&!memcmp(b+i,from,fl)){memcpy(b+i,to,fl);c++;i+=fl-1;}
     return c;
 }
 
-/* Count occurrences of a string. */
-static size_t count_str(const char *h, size_t hl, const char *n)
-{
-    size_t c = 0, nl = strlen(n);
-    for (size_t i = 0; i + nl <= hl; i++)
-        if (h[i] == n[0] && !memcmp(h+i, n, nl)) c++;
-    return c;
-}
-
-/* ── Segment table ──────────────────────────────────────────────── */
+/* ── Segment table ───────────────────────────────────────────────── */
 #define MAX_SEGS 32
-typedef struct { char name[17]; uint64_t va, sz, foff, fsz; } seg_t;
-static seg_t segs[MAX_SEGS];
-static int   nseg;
+typedef struct{char name[17];uint64_t va,sz,foff,fsz;}seg_t;
+static seg_t segs[MAX_SEGS]; static int nseg;
 
 static void build_segs(const uint8_t *buf, size_t bufsz)
 {
-    uint32_t ncmds; memcpy(&ncmds, buf+16, 4);
-    size_t off = 32;
-    for (uint32_t i = 0; i < ncmds && nseg < MAX_SEGS; i++) {
-        if (off + 8 > bufsz) break;
-        uint32_t cmd, csz;
-        memcpy(&cmd, buf+off, 4); memcpy(&csz, buf+off+4, 4);
-        if (csz < 8 || off+csz > bufsz) break;
-        if (cmd == LC_SEGMENT_64) {
-            memcpy(segs[nseg].name, buf+off+8, 16);
-            segs[nseg].name[16] = '\0';
-            memcpy(&segs[nseg].va,   buf+off+24, 8);
-            memcpy(&segs[nseg].sz,   buf+off+32, 8);
-            memcpy(&segs[nseg].foff, buf+off+40, 8);
-            memcpy(&segs[nseg].fsz,  buf+off+48, 8);
+    uint32_t nc; memcpy(&nc,buf+16,4);
+    size_t off=32;
+    for(uint32_t i=0;i<nc&&nseg<MAX_SEGS;i++){
+        if(off+8>bufsz)break;
+        uint32_t cmd,csz; memcpy(&cmd,buf+off,4); memcpy(&csz,buf+off+4,4);
+        if(csz<8||off+csz>bufsz)break;
+        if(cmd==LC_SEGMENT_64){
+            memcpy(segs[nseg].name,buf+off+8,16); segs[nseg].name[16]='\0';
+            memcpy(&segs[nseg].va,  buf+off+24,8);
+            memcpy(&segs[nseg].sz,  buf+off+32,8);
+            memcpy(&segs[nseg].foff,buf+off+40,8);
+            memcpy(&segs[nseg].fsz, buf+off+48,8);
             nseg++;
         }
-        off += csz;
+        off+=csz;
     }
 }
 
 static uint64_t va2foff(uint64_t va)
 {
-    for (int i = 0; i < nseg; i++)
-        if (va >= segs[i].va && va < segs[i].va + segs[i].sz)
-            return segs[i].foff + (va - segs[i].va);
+    for(int i=0;i<nseg;i++)
+        if(va>=segs[i].va&&va<segs[i].va+segs[i].sz)
+            return segs[i].foff+(va-segs[i].va);
     return UINT64_MAX;
 }
 
-/* ── Main ───────────────────────────────────────────────────────── */
-int main(int argc, char **argv)
+/*
+ * find_dialog_text_exec(): locate AppleDialogPMU's TEXT_EXEC.
+ *
+ * The plist may contain multiple kexts near "AppleDialogPMU" strings
+ * (IDREF de-duplication). We search for the canonical CFBundleIdentifier
+ * string and then scan FORWARD from that point for
+ * _PrelinkExecutableLoadAddr, avoiding false-positive backward matches.
+ */
+static int find_dialog_text_exec(const uint8_t *buf, size_t bufsz,
+                                 uint64_t *tx_foff_out, uint64_t *tx_sz_out)
 {
-    int dry = 0, ai = 1;
-    while (ai < argc && argv[ai][0] == '-' && argv[ai][1]) {
-        if      (!strcmp(argv[ai], "-n")) dry = 1;
-        else if (!strcmp(argv[ai], "-v")) verbose_flag = 1;
-        else { fprintf(stderr, "unknown option %s\n", argv[ai]); return 2; }
-        ai++;
-    }
-    if (argc - ai < 1 || argc - ai > 2) {
-        fprintf(stderr, "usage: %s [-n] [-v] kernel13.raw [out.raw]\n", argv[0]);
-        return 2;
-    }
+    /* Find __PRELINK_INFO */
+    size_t pi_fo=0; uint64_t pi_fs=0;
+    for(int i=0;i<nseg;i++)
+        if(!strncmp(segs[i].name,"__PRELINK_INFO",16))
+            {pi_fo=(size_t)segs[i].foff; pi_fs=segs[i].fsz;}
+    if(!pi_fs){fprintf(stderr,"error: __PRELINK_INFO missing\n");return 0;}
 
-    const char *inpath = argv[ai];
-    char outbuf[4096]; const char *outpath;
-    if (argc - ai == 2) outpath = argv[ai+1];
-    else { snprintf(outbuf, sizeof(outbuf), "%s.patched", inpath); outpath = outbuf; }
+    const char *info=(const char*)buf+pi_fo;
+    size_t ilen=(size_t)pi_fs;
+    while(ilen&&info[ilen-1]=='\0')ilen--;
 
-    /* --- load file --- */
-    FILE *f = fopen(inpath, "rb");
-    if (!f) die("cannot open input");
-    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (fsz < 32) die("file too small");
-    uint8_t *buf = malloc((size_t)fsz);
-    if (!buf) die("out of memory");
-    if (fread(buf, 1, (size_t)fsz, f) != (size_t)fsz) die("read failed");
-    fclose(f);
-
-    uint32_t magic; memcpy(&magic, buf, 4);
-    if (magic != MH_MAGIC_64) die("not a 64-bit Mach-O");
-
-    build_segs(buf, (size_t)fsz);
-
-    /* --- locate __PRELINK_INFO --- */
-    size_t pi_foff = 0, pi_fsz = 0;
-    for (int i = 0; i < nseg; i++) {
-        if (!strncmp(segs[i].name, "__PRELINK_INFO", 16)) {
-            pi_foff = (size_t)segs[i].foff;
-            pi_fsz  = (size_t)segs[i].fsz;
-        }
-    }
-    if (!pi_fsz || pi_foff + pi_fsz > (size_t)fsz)
-        die("__PRELINK_INFO not found");
-
-    char   *info = (char*)buf + pi_foff;
-    size_t  ilen = pi_fsz;
-    while (ilen && info[ilen-1] == '\0') ilen--;
-
-    /* --- verify this is the right kernel --- */
-    if (!memmem(info, ilen, "com.apple.driver.AppleD2207PMU",
-                strlen("com.apple.driver.AppleD2207PMU")))
-        die("AppleD2207PMU kext not found -- wrong kernel?");
-    if (memmem(info, ilen, "com.apple.driver.AppleD2186PMU",
-               strlen("com.apple.driver.AppleD2186PMU")))
-        die("AppleD2186PMU already present -- already patched or wrong kernel");
-
-    /* --- find D2207 LDO table --- */
-    size_t ldo_foff = 0;
-    size_t ldo_count = find_bytes(buf, (size_t)fsz,
-                                  D2207_LDO, LDO_BYTES, &ldo_foff);
-    int ldo_done = 0;
-    if (ldo_count == 0) {
-        /* Check if D2186 LDO already installed */
-        size_t tmp;
-        if (find_bytes(buf, (size_t)fsz, D2186_LDO, LDO_BYTES, &tmp) == 1) {
-            ldo_done = 1;
-            ldo_foff = tmp;
-            printf("[2] LDO table already D2186\n");
-        } else {
-            die("D2207 LDO table not found and D2186 not present -- wrong kernel?");
-        }
-    } else if (ldo_count > 1) {
-        die("D2207 LDO table appears more than once -- refusing");
-    }
-
-    /* --- find D2207 register address pairs in kext TEXT_EXEC --- */
     /*
-     * We search the whole file for the pair (MOVZ W1,#0x4240 ; MOVK W1,#0xf,lsl#16)
-     * and expect exactly 2 consecutive occurrences (as found in analysis).
+     * Find the AppleDialogPMU entry by locating its CFBundleIdentifier.
+     * Search for the canonical key/value pair to avoid IDREF false hits.
      */
-    size_t reg_hits[16]; int nreg_hits = 0;
-    int reg_done = 0;
-    for (size_t i = 0; i + 8 <= (size_t)fsz; i += 4) {
-        if (rd32(buf+i)   == INSN_MOVZ_W1_4240 &&
-            rd32(buf+i+4) == INSN_MOVK_W1_F_16) {
-            if (nreg_hits < 16) reg_hits[nreg_hits++] = i;
-        }
+    static const char DLG_BID[] =
+        "<key>CFBundleIdentifier</key>"
+        "<string>com.apple.driver.AppleDialogPMU</string>";
+    const char *bid_hit = NULL;
+    for(size_t i=0; i+strlen(DLG_BID)<=ilen; i++)
+        if(!memcmp(info+i, DLG_BID, strlen(DLG_BID))){bid_hit=info+i; break;}
+    if(!bid_hit){
+        fprintf(stderr,"error: AppleDialogPMU CFBundleIdentifier not found\n");
+        return 0;
     }
-    if (nreg_hits == 0) {
-        /* Check if already patched */
-        int found_patched = 0;
-        for (size_t i = 0; i + 8 <= (size_t)fsz; i += 4) {
-            if (rd32(buf+i)   == INSN_MOVZ_W1_0000 &&
-                rd32(buf+i+4) == INSN_NOP) {
-                found_patched++;
+
+    /* Scan FORWARD up to 8 KB for _PrelinkExecutableLoadAddr */
+    size_t fwd_len = ilen-(size_t)(bid_hit-info);
+    if(fwd_len>8192) fwd_len=8192;
+    static const char LA_KEY[] = "_PrelinkExecutableLoadAddr</key>";
+    const char *la = NULL;
+    for(size_t i=0; i+strlen(LA_KEY)<=fwd_len; i++)
+        if(!memcmp(bid_hit+i, LA_KEY, strlen(LA_KEY))){la=bid_hit+i+strlen(LA_KEY); break;}
+
+    /* If not found forward, also try 4 KB backward (some plist orderings) */
+    if(!la){
+        size_t bwd_start=(size_t)(bid_hit-info)>4096?(size_t)(bid_hit-info)-4096:0;
+        const char *bwd=info+bwd_start;
+        size_t bwd_len=(size_t)(bid_hit-bwd);
+        const char *p=bwd;
+        while(p+strlen(LA_KEY)<=(bwd+bwd_len))
+            if(!memcmp(p,LA_KEY,strlen(LA_KEY))){la=p+strlen(LA_KEY);p+=strlen(LA_KEY);}
+            else p++;
+        /* la now points to the LAST occurrence before bid_hit */
+    }
+    if(!la){fprintf(stderr,"error: _PrelinkExecutableLoadAddr not found for DialogPMU\n");return 0;}
+
+    const char *gt=memchr(la,'>',512);
+    if(!gt){fprintf(stderr,"error: bad integer tag\n");return 0;}
+    char *ep; uint64_t load_addr=strtoull(gt+1,&ep,0);
+    if(ep==gt+1){fprintf(stderr,"error: bad load addr value\n");return 0;}
+    printf("[*] AppleDialogPMU _PrelinkExecutableLoadAddr = 0x%llx\n",
+           (unsigned long long)load_addr);
+
+    /* Map to file offset */
+    uint64_t kfo=va2foff(load_addr);
+    if(kfo==UINT64_MAX||kfo+64>bufsz){
+        fprintf(stderr,"error: cannot map DialogPMU load addr\n");return 0;}
+
+    /* Parse embedded Mach-O for __TEXT_EXEC */
+    const uint8_t *km=buf+kfo;
+    uint32_t km_magic; memcpy(&km_magic,km,4);
+    if(km_magic!=MH_MAGIC_64){
+        fprintf(stderr,"error: bad kext Mach-O magic %#x\n",km_magic);return 0;}
+    uint32_t knc; memcpy(&knc,km+16,4);
+    size_t koff=32;
+    for(uint32_t i=0;i<knc;i++){
+        if(koff+8>0x8000)break;
+        uint32_t kcmd,kcsz; memcpy(&kcmd,km+koff,4); memcpy(&kcsz,km+koff+4,4);
+        if(kcsz<8||koff+kcsz>0x8000)break;
+        if(kcmd==LC_SEGMENT_64){
+            char sn[17]; memcpy(sn,km+koff+8,16); sn[16]='\0';
+            if(!strncmp(sn,"__TEXT_EXEC",16)){
+                uint64_t kva,kvs;
+                memcpy(&kva,km+koff+24,8); memcpy(&kvs,km+koff+32,8);
+                uint64_t txfo=va2foff(kva);
+                if(txfo==UINT64_MAX){
+                    fprintf(stderr,"error: cannot map DialogPMU TEXT_EXEC VA\n");return 0;}
+                printf("[*] AppleDialogPMU __TEXT_EXEC VA=0x%llx sz=0x%llx foff=0x%llx\n",
+                       (unsigned long long)kva,(unsigned long long)kvs,(unsigned long long)txfo);
+                *tx_foff_out=txfo; *tx_sz_out=kvs;
+                return 1;
             }
         }
-        if (found_patched >= 2) {
-            reg_done = 1;
-            printf("[5] Register address already patched (%d sites)\n", found_patched);
-        } else {
-            die("D2207 register address signature not found -- wrong kernel?");
-        }
+        koff+=kcsz;
     }
-    if (nreg_hits > 0 && nreg_hits != 2)
-        fprintf(stderr, "warning: expected 2 register address sites, found %d\n", nreg_hits);
+    fprintf(stderr,"error: AppleDialogPMU __TEXT_EXEC segment not found\n");
+    return 0;
+}
 
-    /* --- plist state --- */
-    int plist_name_done = (count_str(info, ilen, "pmu,d2186") >= 1 &&
-                           count_str(info, ilen, "pmu,d2207") == 0);
-    int plist_cls_done  = (count_str(info, ilen, "AppleD2186PMU") >= 1 &&
-                           count_str(info, ilen, "AppleD2207PMU") == 0);
-
-    if (plist_name_done && plist_cls_done && ldo_done && reg_done) {
-        printf("Already fully patched. Nothing to do.\n");
-        free(buf); return 0;
+/* ── Main ────────────────────────────────────────────────────────── */
+int main(int argc, char **argv)
+{
+    int dry=0,no_reg=0,ai=1;
+    while(ai<argc&&argv[ai][0]=='-'&&argv[ai][1]){
+        if     (!strcmp(argv[ai],"-n"))dry=1;
+        else if(!strcmp(argv[ai],"-v"))verbose_flag=1;
+        else if(!strcmp(argv[ai],"-B"))no_reg=1;
+        else{fprintf(stderr,"unknown option %s\n",argv[ai]);return 2;}
+        ai++;
     }
-
-    /* ===== Apply patches ===== */
-
-    /* [1] plist IONameMatch */
-    if (!plist_name_done) {
-        size_t c = count_str(info, ilen, OLD_NAMEMATCH);
-        if (c == 0) die("pmu,d2207 string not found in plist");
-        size_t replaced = replace_str(info, ilen, OLD_NAMEMATCH, NEW_NAMEMATCH);
-        printf("[1] IONameMatch: %zu occurrence(s) pmu,d2207 -> pmu,d2186\n", replaced);
-    } else {
-        printf("[1] IONameMatch already pmu,d2186\n");
+    if(argc-ai<1||argc-ai>2){
+        fprintf(stderr,"usage: %s [-n] [-v] [-B] kernel13.raw [out.raw]\n",argv[0]);
+        return 2;
     }
+    const char *inpath=argv[ai];
+    char obuf[4096]; const char *outpath;
+    if(argc-ai==2) outpath=argv[ai+1];
+    else{snprintf(obuf,sizeof(obuf),"%s.patched",inpath);outpath=obuf;}
 
-    /* [2][3] plist IOClass / IOProviderClass */
-    if (!plist_cls_done) {
-        size_t c207 = count_str(info, ilen, OLD_CLASS);
-        if (c207 == 0) die("AppleD2207PMU class string not found");
-        size_t replaced = replace_str(info, ilen, OLD_CLASS, NEW_CLASS);
-        printf("[2][3] IOClass/IOProviderClass: %zu occurrence(s) AppleD2207PMU -> AppleD2186PMU\n",
-               replaced);
-    } else {
-        printf("[2][3] IOClass already AppleD2186PMU\n");
-    }
+    /* Load */
+    FILE *f=fopen(inpath,"rb");
+    if(!f)die("cannot open input");
+    fseek(f,0,SEEK_END); long fl=ftell(f); fseek(f,0,SEEK_SET);
+    if(fl<32)die("file too small");
+    size_t fsz=(size_t)fl;
+    uint8_t *buf=malloc(fsz);
+    if(!buf)die("out of memory");
+    if(fread(buf,1,fsz,f)!=fsz)die("read failed");
+    fclose(f);
+
+    uint32_t magic; memcpy(&magic,buf,4);
+    if(magic!=MH_MAGIC_64)die("not a 64-bit little-endian Mach-O");
+    build_segs(buf,fsz);
+
+    /* PRELINK_INFO */
+    size_t pi_foff=0,pi_fsz=0;
+    for(int i=0;i<nseg;i++)
+        if(!strncmp(segs[i].name,"__PRELINK_INFO",16))
+            {pi_foff=(size_t)segs[i].foff;pi_fsz=(size_t)segs[i].fsz;}
+    if(!pi_fsz)die("__PRELINK_INFO not found");
+    char *info=(char*)buf+pi_foff;
+    size_t ilen=pi_fsz;
+    while(ilen&&info[ilen-1]=='\0')ilen--;
+
+    /* Identity check */
+    if(!memmem(info,ilen,"com.apple.driver.AppleD2207PMU",30))
+        die("AppleD2207PMU not found -- wrong kernel?");
+    if(memmem(info,ilen,"com.apple.driver.AppleD2186PMU",30))
+        die("AppleD2186PMU already present -- already patched or wrong kernel");
+
+    /* Locate AppleDialogPMU TEXT_EXEC */
+    uint64_t dlg_tx_foff=0,dlg_tx_sz=0;
+    int have_dlg=find_dialog_text_exec(buf,fsz,&dlg_tx_foff,&dlg_tx_sz);
+
+    /* ── Assess current state ── */
 
     /* [4] LDO table */
-    if (!ldo_done) {
-        memcpy(buf + ldo_foff, D2186_LDO, LDO_BYTES);
-        printf("[4] LDO table @foff=0x%zx replaced (D2207 -> D2186, 20 rows)\n", ldo_foff);
-        if (verbose_flag) {
-            for (int r = 0; r < 20; r++) {
-                const uint8_t *od = D2207_LDO + r*12;
-                const uint8_t *nd = D2186_LDO + r*12;
-                if (memcmp(od, nd, 12)) {
-                    /* Print voltage change: bytes 0-1 = millivolts * 10 LE */
-                    uint16_t ov, nv;
-                    memcpy(&ov, od, 2); memcpy(&nv, nd, 2);
-                    printf("      ldo%-2d: %u -> %u mV*10\n", r+1, ov, nv);
+    size_t ldo_foff=0;
+    size_t n207=count_bytes(buf,fsz,D2207_LDO,LDO_BYTES,&ldo_foff);
+    size_t n186_tmp; {size_t t;n186_tmp=count_bytes(buf,fsz,D2186_LDO,LDO_BYTES,&t);}
+    int ldo_done=(n207==0&&n186_tmp>=1);
+    if(!ldo_done&&n207==0)die("D2207 LDO table not found -- wrong kernel?");
+    if(!ldo_done&&n207>1) die("D2207 LDO table appears >1 time -- refusing");
+
+    /* [5] Register address sites in AppleDialogPMU TEXT_EXEC */
+    size_t reg_sites[4]; int nreg=0,reg_done=0;
+    if(!no_reg&&have_dlg){
+        size_t lo=(size_t)dlg_tx_foff, hi=(size_t)(dlg_tx_foff+dlg_tx_sz);
+        for(size_t i=lo; i+8<=hi&&i+8<=fsz; i+=4){
+            if(rd32(buf+i)==INSN_MOVZ_W1_4240&&rd32(buf+i+4)==INSN_MOVK_W1_F16){
+                if(nreg<4)reg_sites[nreg++]=i;
+            }
+        }
+        if(nreg==0){
+            int np=0;
+            for(size_t i=lo;i+8<=hi&&i+8<=fsz;i+=4)
+                if(rd32(buf+i)==INSN_MOVZ_W1_0308&&rd32(buf+i+4)==INSN_NOP)np++;
+            if(np>=2){reg_done=1;}
+            else{fprintf(stderr,"warning: reg addr sig not found in DialogPMU; skipping [5]\n");no_reg=1;}
+        } else if(nreg!=2){
+            fprintf(stderr,"warning: expected 2 reg sites, found %d\n",nreg);
+        }
+    }
+
+    int pname_done=(count_str(info,ilen,"pmu,d2186")>=1&&count_str(info,ilen,"pmu,d2207")==0);
+
+    if(pname_done&&ldo_done&&(no_reg||reg_done)){
+        printf("Already fully patched. Nothing to do.\n");
+        free(buf);return 0;
+    }
+
+    /* ===== Apply ===== */
+
+    if(!pname_done){
+        size_t c=replace_str(info,ilen,OLD_NAMEMATCH,NEW_NAMEMATCH);
+        printf("[1] IONameMatch: %zu pmu,d2207 -> pmu,d2186\n",c);
+    } else printf("[1] IONameMatch already pmu,d2186\n");
+
+    if(!ldo_done){
+        memcpy(buf+ldo_foff,D2186_LDO,LDO_BYTES);
+        printf("[2] LDO table @foff=0x%zx: D2207 -> D2186 voltages\n",ldo_foff);
+        if(verbose_flag){
+            for(int r=0;r<20;r++){
+                if(memcmp(D2207_LDO+r*12,D2186_LDO+r*12,12)){
+                    uint16_t ov,nv;
+                    memcpy(&ov,D2207_LDO+r*12,2);memcpy(&nv,D2186_LDO+r*12,2);
+                    printf("      ldo%-2d: %u -> %u (x10 mV)\n",r+1,ov,nv);
                 }
             }
         }
-    }
+    } else printf("[2] LDO table already D2186\n");
 
-    /* [5] Register address patch */
-    if (!reg_done) {
-        for (int i = 0; i < nreg_hits; i++) {
-            size_t off = reg_hits[i];
-            wr32(buf + off,   INSN_MOVZ_W1_0000);  /* movz w1, #0x0000 */
-            wr32(buf + off+4, INSN_NOP);             /* nop               */
-            if (verbose_flag)
-                printf("      reg patch @foff=0x%zx\n", off);
+    if(!no_reg&&!reg_done){
+        const uint32_t *ctxs[2]={(const uint32_t*)CTX_SITE0,(const uint32_t*)CTX_SITE1};
+        int patched=0;
+        for(int i=0;i<nreg;i++){
+            size_t s=reg_sites[i];
+            if(s<12){fprintf(stderr,"warning: site %d too close to start\n",i);continue;}
+            /* Verify 3-word context guard */
+            int ok=1;
+            for(int j=0;j<3;j++){
+                uint32_t got=rd32(buf+s-(size_t)(3-j)*4);
+                if(got!=ctxs[i<2?i:1][j]){
+                    fprintf(stderr,
+                      "warning: ctx mismatch site %d [-%d]: got 0x%08x expected 0x%08x\n",
+                      i,3-j,got,ctxs[i<2?i:1][j]);
+                    ok=0; break;
+                }
+            }
+            if(!ok)continue;
+            wr32(buf+s,  INSN_MOVZ_W1_0308);
+            wr32(buf+s+4,INSN_NOP);
+            patched++;
+            if(verbose_flag)
+                printf("      reg site %d @foff=0x%zx: 0x000f4240 -> 0x00000308\n",i,s);
         }
-        printf("[5] D2207 LDO register address (0x000f4240) patched to 0x00000000 "
-               "(%d site(s))\n", nreg_hits);
+        printf("[3] _setLDO I2C reg addr: 0x000f4240 -> 0x00000308 (%d/%d site(s))\n",
+               patched,nreg);
+    } else if(no_reg){
+        printf("[3] -B: register address patch skipped\n");
+    } else {
+        printf("[3] Register address already patched\n");
     }
 
-    /* ===== Post-patch verification ===== */
-    if (count_str(info, ilen, "pmu,d2186") < 1)
-        die("post-patch: pmu,d2186 not found");
-    if (count_str(info, ilen, "pmu,d2207") != 0)
-        die("post-patch: pmu,d2207 still present");
-    if (count_str(info, ilen, "AppleD2186PMU") < 1)
-        die("post-patch: AppleD2186PMU class not found");
-    {
-        size_t tmp;
-        if (find_bytes(buf, (size_t)fsz, D2186_LDO, LDO_BYTES, &tmp) < 1)
-            die("post-patch: D2186 LDO table not found");
-        if (find_bytes(buf, (size_t)fsz, D2207_LDO, LDO_BYTES, &tmp) != 0)
-            die("post-patch: D2207 LDO table still present");
-    }
-    printf("Verified: pmu,d2186 IONameMatch, D2186 LDO table, register addresses.\n");
-    printf("\nNote: This patches the D2207PMU driver to match pmu,d2186 with D2186 LDO\n"
-           "voltage values. The underlying I2C register layout must be compatible\n"
-           "between D2186 and D2207 for full operation.\n");
+    /* ===== Verify ===== */
+    if(count_str(info,ilen,"pmu,d2186")<1)   die("post: pmu,d2186 missing");
+    if(count_str(info,ilen,"pmu,d2207")!=0)  die("post: pmu,d2207 still present");
+    /* IOClass "AppleD2207PMU" intentionally retained — it is the compiled class */
+    {size_t t;
+     if(count_bytes(buf,fsz,D2186_LDO,LDO_BYTES,&t)<1)die("post: D2186 LDO missing");
+     if(count_bytes(buf,fsz,D2207_LDO,LDO_BYTES,&t)!=0)die("post: D2207 LDO remains");}
 
-    if (dry) {
-        printf("Dry run: nothing written.\n");
-        free(buf); return 0;
-    }
+    printf("Verified: pmu,d2186 match, D2186 LDO table%s.\n",
+           no_reg?"":", reg address");
+    printf("\nNote: LDO14-17 zeroed (D2207-only rails). If backlight/WLED issues arise,\n"
+           "those rows may need further refinement from the hardware datasheet.\n");
 
-    f = fopen(outpath, "wb");
-    if (!f) die("cannot open output");
-    if (fwrite(buf, 1, (size_t)fsz, f) != (size_t)fsz) { fclose(f); die("write failed"); }
+    if(dry){printf("Dry run: nothing written.\n");free(buf);return 0;}
+
+    f=fopen(outpath,"wb");
+    if(!f)die("cannot open output");
+    if(fwrite(buf,1,fsz,f)!=fsz){fclose(f);die("write failed");}
     fclose(f);
-    printf("Wrote %s\n", outpath);
+    printf("Wrote %s\n",outpath);
     free(buf);
     return 0;
 }
