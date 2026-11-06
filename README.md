@@ -1,2 +1,4 @@
 # ipodtouch6-ios13
-Install iOS 13.x on iPod touch 6
+
+Current amount of patches for iPod touch 6 iOS 13.
+THIS IS NOT AN INSTALLATION TOOL!
