@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-/* Experimental D2186 GPIO adaptation for the mini4 iOS13.1.x / 13.2 kernels.
+/* Experimental D2186 GPIO adaptation for the mini4 iOS13.1.x / 13.2 / 13.3 kernels.
  * Usage: ./pmuhax2 [-n] [-v] [-B] input-kernel output-kernel
  * -B is the default: preserve native deadlines, and undo pmuhax patch [3].
  * Uses exact whole-function signatures; rejects unsupported code changes.
@@ -214,20 +214,22 @@ static size_t count(struct range r,const uint8_t *s,size_t n,size_t *at) {
 }
 struct patch { const char *name;struct range r;const uint8_t *before,*after;size_t n,p;int change; };
 /* Audited diagnostic-string relocations in otherwise identical GPIO code.
- * 13.1.3 changes two ADD immediates; 13.2 changes both ADRP/ADD pairs.
+ * 13.1.3 changes two ADD immediates; 13.2 and 13.3 move both ADRP/ADD pairs.
  * Match every other byte exactly and retain the selected build's references.
  */
 struct write_variant {
     uint8_t before[sizeof(gpio_write_old)],after[sizeof(gpio_write_new)];
 };
-static struct write_variant write_variants[2];
+enum { WRITE_VARIANT_COUNT=3 };
+static struct write_variant write_variants[WRITE_VARIANT_COUNT];
 static void init_variants(void) {
     const size_t positions[]={0xd8,0xdc,0x110,0x114};
-    const uint32_t words[2][4]={
+    const uint32_t words[WRITE_VARIANT_COUNT][4]={
         {0x90ff8e80,0x913ed400,0x90ff8e80,0x913fc000},
-        {0xb0ff8e20,0x910cd800,0xb0ff8e20,0x910dc400}
+        {0xb0ff8e20,0x910cd800,0xb0ff8e20,0x910dc400},
+        {0x90ff8e20,0x9139d800,0x90ff8e20,0x913ac400}
     };
-    for (unsigned v=0;v<2;v++) {
+    for (unsigned v=0;v<WRITE_VARIANT_COUNT;v++) {
         memcpy(write_variants[v].before,gpio_write_old,sizeof(gpio_write_old));
         memcpy(write_variants[v].after,gpio_write_new,sizeof(gpio_write_new));
         for (unsigned i=0;i<4;i++) for (unsigned j=0;j<4;j++) {
@@ -240,7 +242,7 @@ static void assess(struct patch *p) {
     size_t a=0,b=0,na=count(p->r,p->before,p->n,&a),nb=count(p->r,p->after,p->n,&b);
     if (p->before==gpio_write_old) {
         const uint8_t *selected_before=p->before,*selected_after=p->after;
-        for (unsigned v=0;v<2;v++) {
+        for (unsigned v=0;v<WRITE_VARIANT_COUNT;v++) {
             size_t va=0,vb=0;
             size_t nva=count(p->r,write_variants[v].before,p->n,&va);
             size_t nvb=count(p->r,write_variants[v].after,p->n,&vb);
