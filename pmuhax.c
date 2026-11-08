@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-/* Experimental D2186 GPIO adaptation for the mini4 iOS13.1 kernel.
+/* Experimental D2186 GPIO adaptation for the mini4 iOS13.1 / 13.1.3 kernels.
  * Usage: ./pmuhax2 [-n] [-v] [-B] input-kernel output-kernel
  * -B is the default: preserve native deadlines, and undo pmuhax patch [3].
  * Uses exact whole-function signatures; rejects unsupported code changes.
@@ -216,8 +216,34 @@ static size_t count(struct range r,const uint8_t *s,size_t n,size_t *at) {
     return hits;
 }
 struct patch { const char *name;struct range r;const uint8_t *before,*after;size_t n,p;int change; };
+/* 13.1.3 moves two diagnostic strings by 0xc0. Only the ADD X0
+ * immediates differ; preserve those references in the repaired variant.
+ * All other bytes, including ADRP/BL targets and GPIO logic, remain guarded.
+ */
+static uint8_t gpio_write_1313_old[sizeof(gpio_write_old)];
+static uint8_t gpio_write_1313_new[sizeof(gpio_write_new)];
+static void init_variants(void) {
+    memcpy(gpio_write_1313_old,gpio_write_old,sizeof(gpio_write_old));
+    memcpy(gpio_write_1313_new,gpio_write_new,sizeof(gpio_write_new));
+    const size_t positions[]={0xdc,0x114};
+    const uint32_t words[]={0x913ed400,0x913fc000};
+    for (unsigned i=0;i<2;i++) for (unsigned j=0;j<4;j++) {
+        gpio_write_1313_old[positions[i]+j]=(uint8_t)(words[i]>>(8*j));
+        gpio_write_1313_new[positions[i]+j]=(uint8_t)(words[i]>>(8*j));
+    }
+}
 static void assess(struct patch *p) {
     size_t a=0,b=0,na=count(p->r,p->before,p->n,&a),nb=count(p->r,p->after,p->n,&b);
+    if (p->before==gpio_write_old) {
+        size_t va=0,vb=0;
+        size_t nva=count(p->r,gpio_write_1313_old,p->n,&va);
+        size_t nvb=count(p->r,gpio_write_1313_new,p->n,&vb);
+        if (nva || nvb) {
+            if (na || nb || nva+nvb!=1) die("ambiguous GPIO write variants; no output written");
+            p->before=gpio_write_1313_old;p->after=gpio_write_1313_new;
+            na=nva;nb=nvb;a=va;b=vb;
+        }
+    }
     if (na==1 && nb==0) { p->p=a;p->change=1; }
     else if (na==0 && nb==1) { p->p=b;p->change=0; }
     else { fprintf(stderr,"%s: original=%zu repaired=%zu\n",p->name,na,nb);die("missing, ambiguous, or unsupported patch state; no output written"); }
@@ -265,6 +291,7 @@ int main(int argc,char **argv) {
     /* Validate every operation before changing any bytes. Each complete code
      * function must exactly match either the supported original or our repair.
      * Existing calls, object fields, branches and ABI offsets stay in place. */
+    init_variants();
     for (size_t j=0;j<np;j++) assess(&patches[j]);
     for (size_t j=0;j<np;j++) {
         struct patch *p=&patches[j];
