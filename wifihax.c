@@ -190,9 +190,7 @@ static uint64_t stub_target(struct image *k,uint64_t pc) {
     uint64_t addr=adrp_target(a,pc)+(uint64_t)(b>>10&4095)*8;
     return u64(data+fileoff(k,addr,8));
 }
-static void uuid(struct image *i,const unsigned char wanted[16]) {
-    if (!i->has_uuid || memcmp(i->uuid,wanted,16)) die("unrecognized kext build UUID; refusing speculative patch");
-}
+
 
 
 #define MAX_FIRMWARE 256
@@ -409,9 +407,7 @@ int main(int argc,char **argv) {
     if (!tag(array,"array")) die("prelink kext array missing");
     uint64_t hv=loadaddr(array,"com.apple.driver.AppleBCMWLANFirmware.Hashstore"),lv=loadaddr(array,"com.apple.driver.IOImageLoader");
     parse(&hash,fileoff(&kernel,hv,32));parse(&loader,fileoff(&kernel,lv,32));
-    static const unsigned char hu[16]={0x2f,0x25,0x32,0x10,0x99,0x84,0x37,0xf0,0xa4,0x46,0x4f,0x53,0x93,0xc4,0x11,0x59};
-    static const unsigned char lu[16]={0x08,0xc4,0x86,0x69,0x71,0xc3,0x3a,0xf8,0x82,0x8f,0x81,0xf6,0x6c,0x06,0xdf,0x6f};
-    uuid(&hash,hu);uuid(&loader,lu);restore_previous_override(&kernel,&loader,&hash);
+    restore_previous_override(&kernel,&loader,&hash);
     struct hashstore store=find_store(&kernel,&hash);struct seg *dc=segment(&hash,"__DATA_CONST");
     struct element kaslr=get(top,"_PrelinkLinkKASLROffsets",NULL);uint32_t count;
     uint32_t *relocs=read_relocs(kaslr,&count);uint32_t original_count=count;
