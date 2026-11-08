@@ -25,7 +25,6 @@ struct section { uint64_t vm,size;uint32_t off,flags,reserved1,reserved2;char na
 static struct section sections[128];static unsigned section_count;
 static uint64_t text_vm,text_size;static size_t text_off,commands_end;
 static uint32_t symoff,nsyms,stroff,strsize,indirect_off,indirect_count;
-static const unsigned char uuid[16]={0x74,0x9a,0xc0,0xaf,0x87,0xa0,0x3d,0x95,0x9f,0x4f,0xac,0xda,0x67,0xe5,0xa2,0xf5};
 /* Verified in both MobileGestalt cache tables, against MGGetProductType's
  * 40-byte table row for runtime ProductType 0x1564beb0. MGIsDeviceOfType
  * compares these exact 20 bytes. Native iOS 12's N102 factory uses them. */
@@ -47,14 +46,12 @@ static uint32_t encode_b(uint64_t pc,uint64_t target) {
 static void parse(void) {
     if (length<32 || rd32(0)!=0xfeedfacf || rd32(4)!=0x0100000c || rd32(12)!=2) fail("expected thin little-endian ARM64 Mach-O executable");
     uint32_t n=rd32(16),size=rd32(20);if (size>length-32) fail("load commands exceed file");
-    commands_end=32+size;size_t p=32;int uuid_ok=0,have_text=0;
+    commands_end=32+size;size_t p=32;int have_text=0;
     for (uint32_t i=0;i<n;i++) {
         if (p>commands_end || commands_end-p<8) fail("truncated load command");
         uint32_t c=rd32(p),z=rd32(p+4);if (z<8||z>commands_end-p) fail("invalid command size");
-        if (c==27) {
-            if (z!=24 || uuid_ok) fail("invalid or duplicate UUID command");
-            if (memcmp(bytes+p+8,uuid,16)) fail("unsupported bluetoothd build UUID");uuid_ok=1;
-        } else if (c==25) {
+        /* Build UUIDs do not gate compatibility; code and import checks do. */
+        if (c==25) {
             if (z<72) fail("truncated segment command");
             uint64_t fo=rd64(p+40),fs=rd64(p+48);if (fo>length || fs>length-fo) fail("segment exceeds input");
             uint32_t ns=rd32(p+64);if (ns>(z-72)/80 || ns>128-section_count) fail("invalid section count");
@@ -77,7 +74,7 @@ static void parse(void) {
         } else if (c==0x2c) { if (z<24 || rd32(p+16)) fail("encrypted executable not supported"); }
         p+=z;
     }
-    if (!uuid_ok || !have_text || !section_count) fail("required Mach-O metadata missing");
+    if (!have_text || !section_count) fail("required Mach-O metadata missing");
     if (symoff>length || nsyms>(length-symoff)/16 || stroff>length || strsize>length-stroff ||
         indirect_off>length || indirect_count>(length-indirect_off)/4) fail("symbol metadata out of bounds");
 }
