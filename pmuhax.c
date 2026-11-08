@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-/* Experimental D2186 GPIO adaptation for the mini4 iOS13.1 / 13.1.3 kernels.
+/* Experimental D2186 GPIO adaptation for the mini4 iOS13.1.x / 13.2 kernels.
  * Usage: ./pmuhax2 [-n] [-v] [-B] input-kernel output-kernel
  * -B is the default: preserve native deadlines, and undo pmuhax patch [3].
  * Uses exact whole-function signatures; rejects unsupported code changes.
@@ -173,9 +173,6 @@ static const uint8_t timing1_bad[] = {
     0x64,0x19,0x00,0x94,0xe2,0xc3,0x00,0x91,0x00,0x7d,0x80,0x52,0x01,0x61,0x80,0x52,
     0x1f,0x20,0x03,0xd5,0x68,0x19,0x00,0x94,
 };
-static const uint8_t supported_uuid[] = {
-    0x3d,0x3b,0x4d,0x92,0xf9,0xa8,0x33,0x29,0x84,0xf6,0x46,0xfd,0x3d,0xad,0xeb,0xf8,
-};
 
 static uint8_t *buf; static size_t len;
 static void die(const char *s) { fprintf(stderr,"pmuhax2: %s\n",s); exit(1); }
@@ -195,7 +192,7 @@ static void parse(void) {
         if (p>end || end-p<8) die("truncated load commands");
         uint32_t c=r32(p),n=r32(p+4); if (n<8 || n>end-p) die("invalid load command");
         if (c==27) {
-            if (n!=24 || uuid++ || memcmp(buf+p+8,supported_uuid,16)) die("unsupported kernel UUID");
+            if (n!=24 || uuid++) die("invalid or duplicate UUID command");
         } else if (c==25) {
             if (n<72) die("truncated segment");
             uint64_t f=r64(p+40),s=r64(p+48);
@@ -216,33 +213,44 @@ static size_t count(struct range r,const uint8_t *s,size_t n,size_t *at) {
     return hits;
 }
 struct patch { const char *name;struct range r;const uint8_t *before,*after;size_t n,p;int change; };
-/* 13.1.3 moves two diagnostic strings by 0xc0. Only the ADD X0
- * immediates differ; preserve those references in the repaired variant.
- * All other bytes, including ADRP/BL targets and GPIO logic, remain guarded.
+/* Audited diagnostic-string relocations in otherwise identical GPIO code.
+ * 13.1.3 changes two ADD immediates; 13.2 changes both ADRP/ADD pairs.
+ * Match every other byte exactly and retain the selected build's references.
  */
-static uint8_t gpio_write_1313_old[sizeof(gpio_write_old)];
-static uint8_t gpio_write_1313_new[sizeof(gpio_write_new)];
+struct write_variant {
+    uint8_t before[sizeof(gpio_write_old)],after[sizeof(gpio_write_new)];
+};
+static struct write_variant write_variants[2];
 static void init_variants(void) {
-    memcpy(gpio_write_1313_old,gpio_write_old,sizeof(gpio_write_old));
-    memcpy(gpio_write_1313_new,gpio_write_new,sizeof(gpio_write_new));
-    const size_t positions[]={0xdc,0x114};
-    const uint32_t words[]={0x913ed400,0x913fc000};
-    for (unsigned i=0;i<2;i++) for (unsigned j=0;j<4;j++) {
-        gpio_write_1313_old[positions[i]+j]=(uint8_t)(words[i]>>(8*j));
-        gpio_write_1313_new[positions[i]+j]=(uint8_t)(words[i]>>(8*j));
+    const size_t positions[]={0xd8,0xdc,0x110,0x114};
+    const uint32_t words[2][4]={
+        {0x90ff8e80,0x913ed400,0x90ff8e80,0x913fc000},
+        {0xb0ff8e20,0x910cd800,0xb0ff8e20,0x910dc400}
+    };
+    for (unsigned v=0;v<2;v++) {
+        memcpy(write_variants[v].before,gpio_write_old,sizeof(gpio_write_old));
+        memcpy(write_variants[v].after,gpio_write_new,sizeof(gpio_write_new));
+        for (unsigned i=0;i<4;i++) for (unsigned j=0;j<4;j++) {
+            write_variants[v].before[positions[i]+j]=(uint8_t)(words[v][i]>>(8*j));
+            write_variants[v].after[positions[i]+j]=(uint8_t)(words[v][i]>>(8*j));
+        }
     }
 }
 static void assess(struct patch *p) {
     size_t a=0,b=0,na=count(p->r,p->before,p->n,&a),nb=count(p->r,p->after,p->n,&b);
     if (p->before==gpio_write_old) {
-        size_t va=0,vb=0;
-        size_t nva=count(p->r,gpio_write_1313_old,p->n,&va);
-        size_t nvb=count(p->r,gpio_write_1313_new,p->n,&vb);
-        if (nva || nvb) {
-            if (na || nb || nva+nvb!=1) die("ambiguous GPIO write variants; no output written");
-            p->before=gpio_write_1313_old;p->after=gpio_write_1313_new;
-            na=nva;nb=nvb;a=va;b=vb;
+        const uint8_t *selected_before=p->before,*selected_after=p->after;
+        for (unsigned v=0;v<2;v++) {
+            size_t va=0,vb=0;
+            size_t nva=count(p->r,write_variants[v].before,p->n,&va);
+            size_t nvb=count(p->r,write_variants[v].after,p->n,&vb);
+            if (nva || nvb) {
+                if (na || nb || nva+nvb!=1) die("ambiguous GPIO write variants; no output written");
+                selected_before=write_variants[v].before;selected_after=write_variants[v].after;
+                na=nva;nb=nvb;a=va;b=vb;
+            }
         }
+        p->before=selected_before;p->after=selected_after;
     }
     if (na==1 && nb==0) { p->p=a;p->change=1; }
     else if (na==0 && nb==1) { p->p=b;p->change=0; }
