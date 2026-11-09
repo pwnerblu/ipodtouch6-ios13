@@ -134,11 +134,17 @@ int main(int argc,char **argv) {
         size_t base=fileoff(sec->vm,(size_t)sec->size);
         for (size_t i=12;i+32<=sec->size;i+=4) {
             size_t p=base+i;uint32_t w=rd32(p);
+            /* 13.4 grows the platform object and uses MOVZ for selector 3.
+             * Keep the older pair intact; never change allocation/constructor
+             * instructions. Both layouts use the same three-entry MG list.
+             */
+            int known_layout=(rd32(p+16)==0x52805e00 && rd32(p+28)==0x320007e1) ||
+                             (rd32(p+16)==0x52806000 && rd32(p+28)==0x52800061);
             if (rd32(p-12)!=0xd10243a8 || rd32(p-8)!=0xd101c3b3 || rd32(p-4)!=0xf90003f3 ||
                 (w!=0xa900ffe8 && (w&0xfc000000)!=0x14000000) || rd32(p+4)!=0xd10143a0 ||
                 (rd32(p+8)&0xfc000000)!=0x94000000 || (rd32(p+12)&0xff00001f)!=0x34000000 ||
-                rd32(p+16)!=0x52805e00 || (rd32(p+20)&0xfc000000)!=0x94000000 ||
-                rd32(p+24)!=0xaa0003f3 || rd32(p+28)!=0x320007e1) continue;
+                !known_layout || (rd32(p+20)&0xfc000000)!=0x94000000 ||
+                rd32(p+24)!=0xaa0003f3) continue;
             uint64_t pc=text_vm+p-text_off;
             if (!imported(branch_target(rd32(p+8),pc+8),"_MGIsDeviceOneOfType")) fail("device-list call is not the expected MobileGestalt import");
             if (!imported(branch_target(rd32(p+20),pc+20),"__Znwm")) fail("allocation call is not operator new");
