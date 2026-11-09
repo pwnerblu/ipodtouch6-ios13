@@ -301,6 +301,43 @@ static void add_reloc(uint32_t *r,uint32_t *n,uint64_t base,uint64_t v) {
     if (has_reloc(r,*n,(uint32_t)(v-base))) die("unexpected existing relocation in new data");
     r[(*n)++]=(uint32_t)(v-base);
 }
+/* Recover XML capacity only when needed. Shorter decimal spellings of
+ * unsigned integer values preserve plist semantics, IDs and size attributes.
+ * Restrict edits to the prefix before the relocation data and update its
+ * offsets after each move; do not rewrite strings or binary data payloads.
+ */
+static void compact_integer_prefix(size_t info,size_t capacity,size_t need,
+                                   size_t *used,size_t *start,size_t *end) {
+    size_t cursor=info,recovered=0;
+    while (need>=capacity-*used && cursor+9<*start) {
+        if (memcmp(data+cursor,"<integer",8) ||
+            !(data[cursor+8]=='>' || space(data[cursor+8]))) { cursor++;continue; }
+        struct element item=element((char *)data+cursor,(char *)data+*start,0);
+        if (!tag(item,"integer")) die("unexpected XML element during compaction");
+        size_t next=(size_t)(item.end-(char *)data),old=(size_t)(item.close-item.content);
+        if (old && old<128) {
+            char value[128],shorter[32],*tail;memcpy(value,item.content,old);value[old]=0;
+            const char *begin=value;while (space(*begin)) begin++;
+            if (*begin!='-' && *begin!='+') {
+                errno=0;unsigned long long number=strtoull(begin,&tail,0);
+                while (space(*tail)) tail++;
+                if (!errno && tail!=begin && !*tail) {
+                    int z=snprintf(shorter,sizeof(shorter),"%llu",number);
+                    if (z>0 && (size_t)z<old) {
+                        size_t from=(size_t)(item.content-(char *)data),to=(size_t)(item.close-(char *)data);
+                        size_t saved=old-(size_t)z;
+                        memmove(data+from+z,data+to,info+*used-to+1);memcpy(data+from,shorter,(size_t)z);
+                        memset(data+info+*used-saved+1,0,saved);
+                        *used-=saved;*start-=saved;*end-=saved;next-=saved;recovered+=saved;
+                    }
+                }
+            }
+        }
+        cursor=next;
+    }
+    if (need>=capacity-*used) die("not enough prelink XML padding for KASLR records after lossless compaction");
+    if (recovered) printf("Recovered %zu bytes of XML capacity using equivalent integer spellings.\n",recovered);
+}
 static void replace_relocs(struct element e,const uint32_t *r,uint32_t n,size_t info,size_t capacity) {
     size_t bytes=4+(size_t)n*4;unsigned char *buf=alloc(bytes);
     for (size_t i=0;i<bytes;i++) { uint32_t w=i<4?n:r[(i-4)/4];buf[i]=(unsigned char)(w>>((i%4)*8)); }
@@ -316,7 +353,7 @@ static void replace_relocs(struct element e,const uint32_t *r,uint32_t n,size_t 
     size_t used=(size_t)(zero-((char *)data+info));
     if (length>old) {
         size_t grow=length-old;
-        if (grow>=capacity-used) die("not enough prelink XML padding for KASLR records");
+        if (grow>=capacity-used) compact_integer_prefix(info,capacity,grow,&used,&start,&end);
         for (size_t i=0;i<=grow;i++) if (data[info+used+i]) die("nonzero prelink XML padding");
     }
     size_t tail=info+used-end+1;memmove(data+start+length,data+end,tail);memcpy(data+start,encoded,length);
@@ -331,7 +368,11 @@ static void restore_previous_override(struct image *k,struct image *loader,struc
     uint64_t site=0;unsigned matches=0;
     for (size_t i=12;i+16<=code->fs;i+=4) {
         uint32_t w=u32(data+cf+i);
-        if (u32(data+cf+i-12)==0xd10203a0 && u32(data+cf+i-8)==0x321b03e2 &&
+        /* Both encode W2=32: older ORR alias and 13.4 MOVZ. The
+         * surrounding comparison and memcmp import are still validated. */
+        uint32_t digest_length=u32(data+cf+i-8);
+        if (u32(data+cf+i-12)==0xd10203a0 &&
+            (digest_length==0x321b03e2 || digest_length==0x52800402) &&
             (u32(data+cf+i-4)&0xfc000000)==0x94000000 &&
             (w==0xaa0003f7 || (w&0xfc000000)==0x14000000) &&
             u32(data+cf+i+4)==0xd10343a0 && u32(data+cf+i+8)==0x52800001 && u32(data+cf+i+12)==0x52800822) { site=code->vm+i;matches++; }
